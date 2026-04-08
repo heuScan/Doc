@@ -633,18 +633,1727 @@
 
 # 五、输入表转化与边界鉴定
 
+## 1.设计目标
+
+    本部分用于定义总控agent在接收到用户输入后，如何将输入由“原始表单/自然语言”稳定转化为“可执行、可审计、可路由”的结构化输入，并在进入任务契约生成前完成一次明确的边界鉴定。
+
+    为避免前端字段、LLM理解结果和后端执行对象之间出现歧义，输入转化固定采用三层表设计：
+    1. 原始输入层：只保留用户提交内容与前端上下文，负责留痕，不参与直接调度；
+    2. 标准化输入层：负责清洗、归一、去重、分类，是后续路由与状态机的唯一输入；
+    3. 边界鉴定层：负责判断任务是否越界、哪些参数必须明确、哪些参数可以模糊默认。
+
+## 2.三层输入表设计
+
+### 2.1 第一层：原始输入表 `raw_input`
+
+    该层只做留痕，不做推理，不做裁决，不作为下游agent直接输入。其目标是完整记录“用户当时说了什么、前端提交了什么、系统收到的原文是什么”，便于后续审计与回放。
+
+| 参数名           | 是否必须 | 是否允许模糊 | 参数解释                                     | 实例                                                               |
+| ---------------- | -------- | ------------ | -------------------------------------------- | ------------------------------------------------------------------ |
+| request_id       | 必须     | 否           | 本次前端请求唯一标识，用于链路追踪           | `req_20260408_0001`                                              |
+| submitter_id     | 必须     | 否           | 提交用户或系统账号标识                       | `user_admin`                                                     |
+| submit_source    | 必须     | 否           | 输入来源，如页面表单、批量导入、接口调用     | `web_form`                                                       |
+| raw_text         | 可以为空 | 是           | 用户自然语言原文，若来自表单可为空           | `帮我分析一下华星科技和它的官网`                                 |
+| raw_form_payload | 可以为空 | 是           | 前端表单原始结构，未经标准化                 | `{"company_name":"华星科技","domain":"www.hxtech.com"}`          |
+| raw_target_list  | 可以为空 | 是           | 用户直接提交的目标列表，保留原顺序           | `["www.hxtech.com","hxtech.com","https://www.hxtech.com/login"]` |
+| raw_intent_hint  | 可以为空 | 是           | 前端显式选择的任务意图，如资产发现、企业情报 | `资产发现`                                                       |
+| raw_output_hint  | 可以为空 | 是           | 用户对输出形式的口头要求或前端选项           | `生成简要报告`                                                   |
+| attachments_refs | 可以为空 | 是           | 附件、截图、补充文件引用                     | `["minio://upload/task1/brief.pdf"]`                             |
+| submitted_at     | 必须     | 否           | 提交时间戳                                   | `2026-04-08T10:15:32+08:00`                                      |
+
+### 2.2 第二层：标准化输入表 `normalized_input`
+
+    该层是总控agent后续plan、能力路由、状态机推进的唯一输入层。所有企业名、域名、网址、地址、意图、输出偏好，都必须在这一层完成归一化；后续模块不得再回头直接读取`raw_input` 进行自由解释。
+
+| 参数名                  | 是否必须 | 是否允许模糊 | 参数解释                                                                     | 实例                                                             |
+| ----------------------- | -------- | ------------ | ---------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| normalized_subject      | 必须     | 条件允许     | 标准化后的目标主体名称；若任务不以企业为中心可为空，但必须由目标集合补足主体 | `华星科技有限公司`                                             |
+| subject_aliases         | 可以缺省 | 是           | 主体别名、简称、历史名、英文名等                                             | `["华星科技","HXTech"]`                                        |
+| normalized_targets      | 必须     | 否           | 标准化后的目标集合，每个目标必须带类型、有效性、来源映射                     | 见下方示例                                                       |
+| target_types            | 必须     | 否           | 本次任务包含的目标类型汇总，如企业、域名、URL、IP、CIDR                      | `["企业","域名","URL"]`                                        |
+| primary_target          | 必须     | 否           | 后续优先分析的主目标，只允许一个                                             | `hxtech.com`                                                   |
+| normalized_intent_tags  | 必须     | 否           | 标准化后的任务意图标签，只能从既定标签集选取                                 | `["企业情报","资产发现","报告输出"]`                           |
+| expected_output_types   | 必须     | 是           | 期望产物类型，可为快照、图谱、报告等                                         | `["任务快照","简要报告"]`                                      |
+| execution_profile       | 必须     | 是           | 默认执行画像，用于决定模块启停                                               | `surface_scan`                                                 |
+| explicit_constraints    | 可以缺省 | 是           | 用户明确提出的限制条件                                                       | `["仅限官网和相关子域","不做深度JS解析"]`                      |
+| normalization_notes     | 可以缺省 | 是           | 标准化过程中产生的备注，如去重、冲突、疑似无效项                             | `["www.hxtech.com 与 hxtech.com 归并","login URL 提取出主域"]` |
+| missing_required_fields | 必须     | 否           | 当前仍缺失的必须字段列表，若为空表示可继续进入边界鉴定                       | `[]`                                                           |
+
+    其中`normalized_targets` 的子结构建议固定如下：
+
+| 子参数名         | 是否必须 | 是否允许模糊 | 参数解释                               | 实例                             |
+| ---------------- | -------- | ------------ | -------------------------------------- | -------------------------------- |
+| raw_value        | 必须     | 否           | 用户提交的原始目标值                   | `https://www.hxtech.com/login` |
+| normalized_value | 必须     | 否           | 标准化后的目标值                       | `www.hxtech.com`               |
+| target_type      | 必须     | 否           | 目标类型                               | `域名`                         |
+| target_role      | 必须     | 是           | 目标角色，如主目标、补充目标、候选目标 | `主目标`                       |
+| is_valid         | 必须     | 否           | 格式是否合法                           | `true`                         |
+| canonical_group  | 可以缺省 | 是           | 归并组标识，用于目标去重               | `domain:hxtech.com`            |
+| derived_from     | 可以缺省 | 是           | 由哪个原始值拆解或归并而来             | `https://www.hxtech.com/login` |
+| note             | 可以缺省 | 是           | 对该目标的额外说明                     | `URL 去路径后归一为域名`       |
+
+### 2.3 第三层：边界鉴定表 `boundary_input`
+
+    该层用于回答“能不能做、做到哪里、哪些条件必须先明确”这三个问题。它不是任务契约本身，但它会直接决定后续是否允许生成任务契约。
+
+| 参数名                   | 是否必须 | 是否允许模糊 | 参数解释                                                  | 实例                                        |
+| ------------------------ | -------- | ------------ | --------------------------------------------------------- | ------------------------------------------- |
+| scope_subject            | 必须     | 条件允许     | 本次任务边界绑定的主体，可以是企业，也可以是域名/地址集合 | `华星科技有限公司`                        |
+| allowed_target_scope     | 必须     | 否           | 允许进入后续执行的目标范围白名单                          | `["hxtech.com","*.hxtech.com"]`           |
+| denied_target_scope      | 可以缺省 | 是           | 明确禁止扩展的范围                                        | `["合作方域名","第三方登录回调域名"]`     |
+| task_goal                | 必须     | 否           | 用户授权的任务目标                                        | `企业情报梳理 + 外围资产盘点`             |
+| data_collection_boundary | 必须     | 否           | 允许的信息收集边界，防止模块自由蔓延                      | `仅收集公开可访问的企业与外围资产信息`    |
+| output_boundary          | 必须     | 是           | 最终允许返回的结果形态                                    | `任务快照 + 简要报告，不输出深度推断链路` |
+| must_clarify_items       | 必须     | 否           | 必须反问的字段及原因列表                                  | `[]`                                      |
+| defaultable_items        | 必须     | 否           | 允许走默认值的字段列表                                    | `["并发等级","报告详细度"]`               |
+| forbidden_modules        | 可以缺省 | 是           | 在当前边界下禁止启动的模块                                | `["流量审查模块","文件情报模块"]`         |
+| conditional_modules      | 可以缺省 | 是           | 仅在满足事件条件后才能补跑的模块                          | `["脚本解析模块","扩展词典模块"]`         |
+| boundary_confidence      | 必须     | 否           | 当前边界判断的置信等级，高/中/低                          | `高`                                      |
+| boundary_notes           | 可以缺省 | 是           | 边界判定备注                                              | `用户仅要求外围盘点，未授权深度应用分析`  |
+
+## 3.三层输入转化示例
+
+### 3.1 原始输入层示例
+
+```json
+{
+  "request_id": "req_20260408_0001",
+  "submitter_id": "user_admin",
+  "submit_source": "web_form",
+  "raw_text": "帮我分析一下华星科技和它的官网，先做企业背景和外围资产整理，输出一个简要报告。",
+  "raw_form_payload": {
+    "company_name": "华星科技",
+    "domain": "https://www.hxtech.com/login",
+    "intent": "资产发现"
+  },
+  "raw_target_list": [
+    "华星科技",
+    "https://www.hxtech.com/login"
+  ],
+  "raw_intent_hint": "资产发现",
+  "raw_output_hint": "简要报告",
+  "attachments_refs": [],
+  "submitted_at": "2026-04-08T10:15:32+08:00"
+}
+```
+
+### 3.2 标准化输入层示例
+
+```json
+{
+  "normalized_subject": "华星科技有限公司",
+  "subject_aliases": [
+    "华星科技"
+  ],
+  "normalized_targets": [
+    {
+      "raw_value": "https://www.hxtech.com/login",
+      "normalized_value": "www.hxtech.com",
+      "target_type": "域名",
+      "target_role": "主目标",
+      "is_valid": true,
+      "canonical_group": "domain:hxtech.com",
+      "derived_from": "https://www.hxtech.com/login",
+      "note": "URL 去路径、去协议后归一"
+    }
+  ],
+  "target_types": [
+    "企业",
+    "域名"
+  ],
+  "primary_target": "www.hxtech.com",
+  "normalized_intent_tags": [
+    "企业情报",
+    "资产发现",
+    "报告输出"
+  ],
+  "expected_output_types": [
+    "任务快照",
+    "简要报告"
+  ],
+  "execution_profile": "surface_scan",
+  "explicit_constraints": [
+    "先做企业背景和外围资产整理"
+  ],
+  "normalization_notes": [
+    "用户给出的 URL 已归一为域名主目标"
+  ],
+  "missing_required_fields": []
+}
+```
+
+### 3.3 边界鉴定层示例
+
+```json
+{
+  "scope_subject": "华星科技有限公司",
+  "allowed_target_scope": [
+    "hxtech.com",
+    "*.hxtech.com"
+  ],
+  "denied_target_scope": [
+    "第三方供应商域名",
+    "与主体无关的外联域名"
+  ],
+  "task_goal": "企业情报梳理 + 外围资产盘点",
+  "data_collection_boundary": "仅收集公开可访问的企业与外围资产信息，不进入深度应用层分析",
+  "output_boundary": "返回任务快照与简要报告",
+  "must_clarify_items": [],
+  "defaultable_items": [
+    "并发等级",
+    "报告详细度",
+    "是否导出图谱文件"
+  ],
+  "forbidden_modules": [
+    "流量审查模块",
+    "文件情报模块"
+  ],
+  "conditional_modules": [
+    "脚本解析模块"
+  ],
+  "boundary_confidence": "高",
+  "boundary_notes": "当前授权足以支持企业情报与外围盘点，但不足以直接启动深度应用分析"
+}
+```
+
+## 4.边界参数设计
+
+### 4.1 边界参数总表
+
+    边界参数用于明确总控agent“可以做什么”“不能做什么”“不确定时是否必须停下来反问”。以下参数必须由边界鉴定层统一给出，不能分散在多个模块中各自解释。
+
+| 边界参数     | 是否必须 | 是否允许模糊 | 作用说明                                     | 模糊处理规则                                                         | 示例                                     |
+| ------------ | -------- | ------------ | -------------------------------------------- | -------------------------------------------------------------------- | ---------------------------------------- |
+| 主体边界     | 必须     | 条件允许     | 明确本次任务围绕谁展开                       | 若企业名不明，但主域明确，可先以主域为边界；若二者都不明，则必须反问 | `华星科技有限公司` 或 `hxtech.com`   |
+| 目标边界     | 必须     | 否           | 明确哪些域名、地址、URL、主体允许进入执行    | 不允许模糊；没有明确目标边界不得进入执行                             | `hxtech.com`、`*.hxtech.com`         |
+| 任务目标边界 | 必须     | 否           | 明确做企业情报、资产发现、应用分析中的哪一类 | 不允许“都做一点”式空泛描述                                         | `企业情报 + 外围资产盘点`              |
+| 收集边界     | 必须     | 否           | 明确允许收集到什么层级                       | 若未说明是否允许深度应用分析，应默认不允许                           | `仅限公开信息与外围资产`               |
+| 输出边界     | 必须     | 是           | 明确输出快照、图谱、报告中的哪些内容         | 若未说明详细程度，可默认简版                                         | `任务快照 + 简要报告`                  |
+| 模块启用边界 | 必须     | 是           | 明确哪些模块直接允许，哪些禁止，哪些条件触发 | 未明确授权的高成本模块默认关闭                                       | `禁止流量审查，脚本解析按条件触发`     |
+| 时间边界     | 可以缺省 | 是           | 是否限定时间范围或时效要求                   | 若未说明，可不作为阻塞项                                             | `近一年企业变更`                       |
+| 成本边界     | 可以缺省 | 是           | token、并发、时长等预算控制                  | 若未说明，采用系统默认画像                                           | `低成本模式`                           |
+| 证据边界     | 可以缺省 | 是           | 允许保留哪些证据对象                         | 若未说明，采用标准保留策略                                           | `保留页面与报告引用，不保留大体积附件` |
+
+### 4.2 必须明确与允许模糊的判定标准
+
+    必须明确的参数，是指“缺失后会直接影响执行边界、可能导致越权、错误路由或错误报告”的参数；允许模糊的参数，是指“缺失后不会改变任务边界，只影响执行风格、资源消耗或呈现颗粒度”的参数。
+
+    必须明确参数如下：
+    1. 主体边界或主目标至少一项明确；
+    2. 目标边界明确；
+    3. 任务目标边界明确；
+    4. 收集边界明确；
+    5. 至少有一种可接受输出形式明确。
+
+    可以模糊参数如下：
+    1. 报告详细度；
+    2. 并发等级；
+    3. 是否输出图谱文件；
+    4. 价值评估结果的展示颗粒度；
+    5. 非关键模块是否预热。
+
+## 5.边界注释规则
+
+### 5.1 注释一：边界参数示例
+
+    注释一：当用户输入“帮我看看华星科技和官网，先整理企业背景和外围资产，给我一个简要报告”时，可判定如下：
+    1. 主体边界为“华星科技有限公司”，若企业全称未完全确认但官网域名明确，可暂以`hxtech.com` 作为主目标补足；
+    2. 目标边界为 `hxtech.com` 及其子域，不自动扩展到第三方外联域名；
+    3. 任务目标边界为“企业情报 + 外围资产盘点”，不等同于“深度应用分析”；
+    4. 收集边界为“公开可访问的信息与外围资产”，因此脚本深度解析、流量审查、文件提取均不默认开启；
+    5. 输出边界为“任务快照 + 简要报告”，报告详细程度可以模糊默认，但“是否输出报告”本身不能模糊。
+
+### 5.2 反问触发规则
+
+    下列情况必须触发反问，不得直接进入任务契约生成：
+    1. 用户只说“帮我看看这个”，没有主体、域名、地址中的任何一个；
+    2. 用户输入同时出现多个无明显关系的主体，无法判断本次任务主对象；
+    3. 用户要求“分析应用”“看看接口”，但没有给出任何网站、域名、URL、地址或企业主体；
+    4. 用户要求“全面分析”，但未说明是否允许深度应用层分析，且当前系统无法安全默认。
+
+    下列情况不需要反问，可走默认值：
+    1. 未说明报告详细版还是简版；
+    2. 未说明是否导出图谱文件；
+    3. 未说明并发等级或时长预算；
+    4. 未说明是否展示中间过程日志。
+
+## 6.落地约束
+
+    为保证输入表转化稳定，工程上应固定以下约束：
+    1. 所有下游模块只能读取`normalized_input` 与 `boundary_input`，不得直接消费 `raw_input`；
+    2. 边界鉴定必须在任务契约生成前完成；
+    3. 任一“必须明确参数”缺失时，状态机只能停留在澄清阶段，不得推进到执行阶段；
+    4. 任一“允许模糊参数”缺失时，必须写入默认值来源，不能留空不管；
+    5. 每一次边界判定都必须留痕，便于后续审计“为什么启动了某个模块，为什么跳过了某个模块”。
+
 # 六、任务契约生成要求与格式设计
+
+## 1.设计目标
+
+    任务契约是总控agent在完成“输入标准化”和“边界鉴定”之后生成的统一执行依据。它的作用不是简单保存几个参数，而是把“这次任务允许做什么、禁止做什么、优先做什么、如何结束、如何复核”固定下来，作为整个任务生命周期的唯一约束锚点。
+
+    任务契约生成后，应同时满足以下要求：
+    1. 下游所有agent都只能在契约范围内执行；
+    2. 调度器只能依据契约决定启用、跳过、补跑和加派；
+    3. 状态机只能在契约允许的阶段和边界内推进；
+    4. 审计与回放时，能够明确说明某个模块为什么被启动或禁止；
+    5. 前端、后端、运行时三方看到的是同一份任务约束定义。
+
+## 2.生成原则
+
+### 2.1 契约生成时机
+
+    任务契约必须在以下条件全部满足后生成：
+    1. `normalized_input（标准化输入）` 已生成；
+    2. `boundary_input（边界鉴定输入）` 已完成；
+    3. 所有“必须明确参数”已明确；
+    4. 不存在未解决的必须反问项。
+
+    若仍存在必须反问项，则不允许进入任务契约生成阶段，只能停留在澄清阶段。
+
+### 2.2 契约生成原则
+
+    任务契约生成建议遵循以下原则：
+    1. 最小必要原则：只启用完成当前目标所需的模块，不默认全开；
+    2. 边界优先原则：契约必须先体现范围和限制，再体现执行路径；
+    3. 可审计原则：所有启用、禁用、默认、降级策略都必须可解释；
+    4. 可执行原则：字段要能直接被调度器、状态机、快照构建器消费；
+    5. 可扩展原则：新增agent或新增阶段时，不应破坏已有契约结构。
+
+## 3.任务契约总体结构
+
+    建议总控agent输出统一结构的 `task_contract（任务契约）`，至少包含以下九个对象：
+    1. `contract_meta（契约元信息）`
+    2. `task_scope（任务范围）`
+    3. `task_objective（任务目标）`
+    4. `execution_policy（执行策略）`
+    5. `module_policy（模块策略）`
+    6. `state_policy（状态策略）`
+    7. `evidence_policy（证据策略）`
+    8. `review_policy（复核策略）`
+    9. `output_policy（输出策略）`
+
+## 4.参数设计
+
+### 4.1 `contract_meta（契约元信息）`
+
+| 参数名 | 是否必须 | 参数注释 | 示例 |
+| --- | --- | --- | --- |
+| contract_id | 必须 | 任务契约唯一标识，用于和任务、状态流转、审计记录关联 | `contract_20260408_0001` |
+| task_id | 必须 | 所属任务唯一标识 | `task_20260408_0001` |
+| contract_version | 必须 | 契约版本号，每次人工修订或重大策略变更递增 | `1` |
+| contract_status | 必须 | 当前契约状态，如有效、待确认、已替换 | `有效` |
+| generated_by | 必须 | 契约生成来源，一般为总控agent | `orchestrator_agent` |
+| generated_at | 必须 | 契约生成时间 | `2026-04-08T10:22:18+08:00` |
+| based_on_inputs | 必须 | 契约基于哪些输入对象生成 | `["normalized_input","boundary_input"]` |
+
+### 4.2 `task_scope（任务范围）`
+
+| 参数名 | 是否必须 | 参数注释 | 示例 |
+| --- | --- | --- | --- |
+| scope_subject | 必须 | 本次任务围绕的主体，可以是企业主体，也可以是主域 | `华星科技有限公司` |
+| primary_target | 必须 | 主目标，作为后续调度和展示的核心对象 | `hxtech.com` |
+| allowed_targets | 必须 | 允许进入执行流程的目标白名单 | `["hxtech.com","*.hxtech.com"]` |
+| denied_targets | 可以缺省 | 明确禁止扩展的目标范围 | `["第三方供应商域名","外部登录回调域名"]` |
+| target_types | 必须 | 本次任务覆盖的目标类型集合 | `["企业","域名"]` |
+| collection_boundary | 必须 | 允许采集的信息边界说明 | `仅收集公开可访问的企业与外围资产信息` |
+| out_of_scope_notes | 可以缺省 | 明确写出不在本次任务内的范围 | `["不进入深度应用层接口语义分析","不处理第三方托管资产"]` |
+
+### 4.3 `task_objective（任务目标）`
+
+| 参数名 | 是否必须 | 参数注释 | 示例 |
+| --- | --- | --- | --- |
+| core_goal | 必须 | 本次任务的核心目标摘要 | `企业情报梳理 + 外围资产盘点` |
+| intent_tags | 必须 | 标准化后的任务意图标签 | `["企业情报","资产发现"]` |
+| expected_outputs | 必须 | 期望输出类型 | `["任务快照","分析层结果"]` |
+| priority_focus | 可以缺省 | 本次任务优先关注的重点方向 | `["主体关联域名","高活跃接口子域"]` |
+| non_goals | 可以缺省 | 明确声明不是本次任务目标的内容 | `["不生成深度推断链路","不做流量内容分析"]` |
+
+### 4.4 `execution_policy（执行策略）`
+
+| 参数名 | 是否必须 | 参数注释 | 示例 |
+| --- | --- | --- | --- |
+| execution_profile | 必须 | 执行画像，决定整体策略，如轻量扫描、表层分析、图谱优先 | `surface_scan` |
+| max_concurrency | 必须 | 当前任务允许的最大并发数 | `4` |
+| token_budget_level | 必须 | 令牌预算等级，如低、中、高 | `中` |
+| max_runtime_minutes | 可以缺省 | 任务最长运行时间，超时后进入告警或降级 | `60` |
+| fallback_strategy | 必须 | 模块失败后的降级策略摘要 | `关键链路失败则重试，非关键链路失败则部分完成` |
+| scheduling_mode | 必须 | 调度模式，如串行优先、并行优先、条件触发 | `条件并行` |
+
+### 4.5 `module_policy（模块策略）`
+
+    该对象用于定义“哪些模块直接启用、哪些禁止、哪些条件触发”，建议拆成三个数组。
+
+| 参数名 | 是否必须 | 参数注释 | 示例 |
+| --- | --- | --- | --- |
+| enabled_modules | 必须 | 本次任务一开始就允许启动的模块列表 | `["企业情报模块","基础发现模块","指纹识别模块"]` |
+| disabled_modules | 必须 | 明确禁止启动的模块列表 | `["流量审查模块","文件情报模块"]` |
+| conditional_modules | 可以缺省 | 只有满足特定事件条件时才允许补跑的模块 | `["脚本解析模块","扩展词典模块"]` |
+| module_notes | 可以缺省 | 模块启停的补充说明 | `["脚本解析仅在发现大量JS资源时启动"]` |
+
+    `conditional_modules（条件模块）` 的子结构建议固定如下：
+
+| 子参数名 | 是否必须 | 参数注释 | 示例 |
+| --- | --- | --- | --- |
+| module_name | 必须 | 模块名称 | `脚本解析模块` |
+| trigger_condition | 必须 | 触发条件说明 | `发现阶段识别到 20 个以上 JS 资源` |
+| trigger_source | 必须 | 由哪个模块或事件触发 | `基础发现模块 / DISCOVERY_BATCH_DONE` |
+| allowed_once | 可以缺省 | 是否只允许触发一次 | `true` |
+| note | 可以缺省 | 补充说明 | `仅对主域及其确认关联域执行` |
+
+### 4.6 `state_policy（状态策略）`
+
+| 参数名 | 是否必须 | 参数注释 | 示例 |
+| --- | --- | --- | --- |
+| allowed_stage_flow | 必须 | 允许的阶段推进顺序 | `["界定范围","发现","分析","关联","优先级判定"]` |
+| allowed_terminal_states | 必须 | 允许进入的结束状态集合 | `["DONE","PARTIAL_DONE","FAILED","QUARANTINED"]` |
+| retryable_states | 必须 | 允许重试的状态集合 | `["DISCOVERING","ANALYZING","RETRYING"]` |
+| pausable | 必须 | 是否允许暂停 | `true` |
+| resumable | 必须 | 是否允许恢复 | `true` |
+| force_review_before_done | 必须 | 是否要求在完成前进行复核 | `false` |
+
+### 4.7 `evidence_policy（证据策略）`
+
+| 参数名 | 是否必须 | 参数注释 | 示例 |
+| --- | --- | --- | --- |
+| retain_evidence_types | 必须 | 允许保留的证据类型集合 | `["HTTP响应","DNS结果","页面片段","执行日志摘要"]` |
+| retain_raw_payload | 必须 | 是否保留原始负载 | `false` |
+| retain_duration_days | 可以缺省 | 证据默认保留天数 | `30` |
+| evidence_size_limit_mb | 可以缺省 | 单对象证据大小上限，超出则摘要化 | `20` |
+| evidence_trace_required | 必须 | 是否要求每条关键结论都必须绑定证据引用 | `true` |
+
+### 4.8 `review_policy（复核策略）`
+
+| 参数名 | 是否必须 | 参数注释 | 示例 |
+| --- | --- | --- | --- |
+| review_required | 必须 | 本次任务是否默认要求复核 | `false` |
+| review_trigger_rules | 必须 | 触发复核的规则集合 | `["高价值但低置信发现","多个agent结论冲突"]` |
+| manual_approval_required | 必须 | 是否需要人工批准才能结束任务 | `false` |
+| review_priority_threshold | 可以缺省 | 进入复核的优先级阈值 | `高` |
+| review_confidence_threshold | 可以缺省 | 进入复核的置信度阈值 | `0.70` |
+
+### 4.9 `output_policy（输出策略）`
+
+| 参数名 | 是否必须 | 参数注释 | 示例 |
+| --- | --- | --- | --- |
+| realtime_enabled | 必须 | 是否输出实时层结果 | `true` |
+| analysis_enabled | 必须 | 是否输出分析层结果 | `true` |
+| include_timeline | 必须 | 是否输出时间线数据 | `true` |
+| include_graph_summary | 可以缺省 | 是否输出图谱摘要信息 | `false` |
+| output_granularity | 必须 | 输出颗粒度，如简要、标准、详细 | `标准` |
+| language | 必须 | 输出语言 | `中文` |
+
+## 5.完整示例
+
+```json
+{
+  "task_contract": {
+    "contract_meta": {
+      "contract_id": "contract_20260408_0001",
+      "task_id": "task_20260408_0001",
+      "contract_version": 1,
+      "contract_status": "有效",
+      "generated_by": "orchestrator_agent",
+      "generated_at": "2026-04-08T10:22:18+08:00",
+      "based_on_inputs": [
+        "normalized_input",
+        "boundary_input"
+      ]
+    },
+    "task_scope": {
+      "scope_subject": "华星科技有限公司",
+      "primary_target": "hxtech.com",
+      "allowed_targets": [
+        "hxtech.com",
+        "*.hxtech.com"
+      ],
+      "denied_targets": [
+        "第三方供应商域名",
+        "外部登录回调域名"
+      ],
+      "target_types": [
+        "企业",
+        "域名"
+      ],
+      "collection_boundary": "仅收集公开可访问的企业与外围资产信息",
+      "out_of_scope_notes": [
+        "不进入深度应用层接口语义分析",
+        "不处理第三方托管资产"
+      ]
+    },
+    "task_objective": {
+      "core_goal": "企业情报梳理 + 外围资产盘点",
+      "intent_tags": [
+        "企业情报",
+        "资产发现"
+      ],
+      "expected_outputs": [
+        "任务快照",
+        "分析层结果"
+      ],
+      "priority_focus": [
+        "主体关联域名",
+        "高活跃接口子域"
+      ],
+      "non_goals": [
+        "不生成深度推断链路",
+        "不做流量内容分析"
+      ]
+    },
+    "execution_policy": {
+      "execution_profile": "surface_scan",
+      "max_concurrency": 4,
+      "token_budget_level": "中",
+      "max_runtime_minutes": 60,
+      "fallback_strategy": "关键链路失败则重试，非关键链路失败则部分完成",
+      "scheduling_mode": "条件并行"
+    },
+    "module_policy": {
+      "enabled_modules": [
+        "企业情报模块",
+        "基础发现模块",
+        "指纹识别模块"
+      ],
+      "disabled_modules": [
+        "流量审查模块",
+        "文件情报模块"
+      ],
+      "conditional_modules": [
+        {
+          "module_name": "脚本解析模块",
+          "trigger_condition": "发现阶段识别到 20 个以上 JS 资源",
+          "trigger_source": "基础发现模块 / DISCOVERY_BATCH_DONE",
+          "allowed_once": true,
+          "note": "仅对主域及其确认关联域执行"
+        }
+      ],
+      "module_notes": [
+        "脚本解析仅在发现大量JS资源时启动"
+      ]
+    },
+    "state_policy": {
+      "allowed_stage_flow": [
+        "界定范围",
+        "发现",
+        "分析",
+        "关联",
+        "优先级判定"
+      ],
+      "allowed_terminal_states": [
+        "DONE",
+        "PARTIAL_DONE",
+        "FAILED",
+        "QUARANTINED"
+      ],
+      "retryable_states": [
+        "DISCOVERING",
+        "ANALYZING",
+        "RETRYING"
+      ],
+      "pausable": true,
+      "resumable": true,
+      "force_review_before_done": false
+    },
+    "evidence_policy": {
+      "retain_evidence_types": [
+        "HTTP响应",
+        "DNS结果",
+        "页面片段",
+        "执行日志摘要"
+      ],
+      "retain_raw_payload": false,
+      "retain_duration_days": 30,
+      "evidence_size_limit_mb": 20,
+      "evidence_trace_required": true
+    },
+    "review_policy": {
+      "review_required": false,
+      "review_trigger_rules": [
+        "高价值但低置信发现",
+        "多个agent结论冲突"
+      ],
+      "manual_approval_required": false,
+      "review_priority_threshold": "高",
+      "review_confidence_threshold": 0.70
+    },
+    "output_policy": {
+      "realtime_enabled": true,
+      "analysis_enabled": true,
+      "include_timeline": true,
+      "include_graph_summary": false,
+      "output_granularity": "标准",
+      "language": "中文"
+    }
+  }
+}
+```
+
+## 6.校验规则
+
+### 6.1 必须校验项
+
+    任务契约生成后，建议总控agent至少执行以下校验：
+    1. `task_id` 与当前任务一致；
+    2. `allowed_targets` 不为空；
+    3. `enabled_modules` 与 `disabled_modules` 不得重复；
+    4. `core_goal` 与 `intent_tags` 不得冲突；
+    5. `allowed_stage_flow` 必须与系统状态机兼容；
+    6. `expected_outputs` 与 `output_policy` 不得冲突；
+    7. `review_required`、`review_trigger_rules` 与任务风险等级逻辑一致。
+
+### 6.2 生成失败处理
+
+    若任务契约生成失败，建议分三类处理：
+    1. 缺失必须输入：回退到澄清阶段；
+    2. 目标与边界冲突：回退到边界鉴定阶段；
+    3. 模块策略或状态策略不合法：标记为系统生成错误，写入审计日志并停止推进。
+
+## 7.落地约束
+
+    为保证任务契约长期稳定，工程上应固定以下约束：
+    1. 下游agent不得自行修改任务契约；
+    2. 人工变更任务契约时必须提升 `contract_version`；
+    3. 任务契约变更后必须记录变更原因与操作来源；
+    4. 任务执行过程中，只允许在明确规则下补充条件模块，不允许静默扩大任务范围；
+    5. 任意阶段的启用、跳过、重试、暂停、复核，都必须能回溯到任务契约中的对应字段。
 
 # 七、返回输出设计
 
 ## 1.实时输出层
 
+### 1.1 设计目标
+
+    实时输出层的目标，不是把底层事件原样推给前端，而是由总控agent输出“可直接展示、可持续刷新、可稳定追踪”的任务运行视图。该层主要回答以下问题：
+    1. 当前任务进行到哪一步；
+    2. 当前正在运行哪些agent；
+    3. 最近发生了什么关键事件；
+    4. 是否出现阻塞、失败、重试、暂停或等待；
+    5. 前端是否需要刷新分析层数据。
+
+    实时输出层只描述“过程状态”和“运行动态”，不承担发现详情聚合，也不直接暴露底层原始事件表。
+
+### 1.2 输出原则
+
+    实时输出层建议遵循以下原则：
+    1. 轻量优先：适合高频轮询或后续消息推送；
+    2. 稳定字段：字段名与结构尽量固定，避免前端频繁改协议；
+    3. 聚合展示：同类底层事件应先由总控agent聚合后再输出；
+    4. 状态优先：先输出状态、阶段、进度、阻塞信息，再输出次级细节；
+    5. 可追踪：关键事件必须保留事件标识与来源引用，便于排障。
+
+### 1.3 输出结构
+
+    实时输出层建议统一输出为 `realtime_snapshot（实时快照）`，结构上至少包含以下六个对象：
+    1. `task_meta（任务元信息）`
+    2. `task_runtime_state（任务运行状态）`
+    3. `active_agents（活跃agent列表）`
+    4. `recent_events（最近事件列表）`
+    5. `runtime_alerts（运行告警列表）`
+    6. `refresh_hints（刷新提示）`
+
+### 1.4 `task_meta（任务元信息）` 参数设计
+
+| 参数名 | 是否必须 | 参数解释 | 示例 |
+| --- | --- | --- | --- |
+| task_id | 必须 | 任务唯一标识 | `task_20260408_0001` |
+| task_name | 可以缺省 | 任务展示名称，供前端列表和详情页展示 | `华星科技外围资产梳理` |
+| task_mode | 必须 | 当前任务执行模式，如标准模式、低成本模式 | `标准模式` |
+| created_at | 必须 | 任务创建时间 | `2026-04-08T10:20:00+08:00` |
+| updated_at | 必须 | 本次实时快照更新时间 | `2026-04-08T10:31:10+08:00` |
+| requester | 可以缺省 | 提交者标识或名称 | `user_admin` |
+
+### 1.5 `task_runtime_state（任务运行状态）` 参数设计
+
+| 参数名 | 是否必须 | 参数解释 | 示例 |
+| --- | --- | --- | --- |
+| current_state | 必须 | 当前任务全局状态 | `DISCOVERING（发现中）` |
+| current_stage | 必须 | 当前任务阶段中文名称 | `发现` |
+| progress_percent | 必须 | 任务进度百分比，范围 0~100 | `32` |
+| stage_progress_percent | 可以缺省 | 当前阶段内的进度百分比 | `57` |
+| status_text | 必须 | 面向前端展示的简短状态文案 | `正在执行基础发现与指纹识别` |
+| is_blocked | 必须 | 当前是否阻塞 | `false` |
+| block_reason | 可以缺省 | 若阻塞，说明阻塞原因 | `等待脚本解析结果返回` |
+| is_paused | 必须 | 当前是否暂停 | `false` |
+| retry_count | 必须 | 当前任务累计重试次数 | `1` |
+| error_count | 必须 | 当前任务累计错误次数 | `0` |
+| active_agent_count | 必须 | 当前正在运行的agent数量 | `2` |
+| queued_agent_count | 必须 | 当前待调度agent数量 | `3` |
+| waiting_signal | 可以缺省 | 当前主要等待信号，如等待事件、等待工具、等待人工复核 | `等待事件` |
+
+### 1.6 `active_agents（活跃agent列表）` 参数设计
+
+    `active_agents（活跃agent列表）` 用于展示“现在是谁在工作”，建议列表内每个对象包含如下字段：
+
+| 参数名 | 是否必须 | 参数解释 | 示例 |
+| --- | --- | --- | --- |
+| agent_run_id | 必须 | 当前执行实例唯一标识 | `run_asset_0012` |
+| agent_name | 必须 | agent名称 | `基础发现agent` |
+| agent_type | 必须 | agent类型标识 | `asset_discovery` |
+| agent_state | 必须 | 当前运行状态 | `RUNNING（执行中）` |
+| start_time | 必须 | 本次执行开始时间 | `2026-04-08T10:29:14+08:00` |
+| last_heartbeat_at | 可以缺省 | 最近心跳时间 | `2026-04-08T10:31:05+08:00` |
+| current_action | 必须 | 当前动作描述 | `正在对主域及子域执行发现任务` |
+| current_target | 可以缺省 | 当前处理目标 | `hxtech.com` |
+| progress_hint | 可以缺省 | 对当前agent内部进展的简要描述 | `已完成 2/5 个子任务` |
+| risk_flag | 可以缺省 | 当前agent是否出现风险标记 | `低` |
+
+### 1.7 `recent_events（最近事件列表）` 参数设计
+
+    最近事件列表不应原样返回全部事件，而应保留“最近 N 条关键事件”，建议默认返回 10 条以内。
+
+| 参数名 | 是否必须 | 参数解释 | 示例 |
+| --- | --- | --- | --- |
+| event_id | 必须 | 事件唯一标识 | `evt_001028` |
+| event_time | 必须 | 事件发生时间 | `2026-04-08T10:30:52+08:00` |
+| event_level | 必须 | 事件级别，如信息、告警、错误 | `信息` |
+| event_type | 必须 | 事件类型 | `DISCOVERY_BATCH_DONE（发现批次完成）` |
+| source_agent | 可以缺省 | 事件来源agent | `基础发现agent` |
+| event_text | 必须 | 面向前端展示的简短事件文案 | `基础发现完成一批目标探测，新增 7 个候选子域` |
+| affects_state | 必须 | 是否影响状态流转 | `true` |
+| related_target | 可以缺省 | 事件关联目标 | `hxtech.com` |
+| next_hint | 可以缺省 | 对后续动作的提示 | `已触发指纹识别继续处理` |
+
+### 1.8 `runtime_alerts（运行告警列表）` 参数设计
+
+    运行告警用于把“值得用户注意但未必是错误”的情况独立展示，避免用户只能从事件流里读异常。
+
+| 参数名 | 是否必须 | 参数解释 | 示例 |
+| --- | --- | --- | --- |
+| alert_id | 必须 | 告警唯一标识 | `alert_0009` |
+| alert_level | 必须 | 告警级别，如提示、注意、高风险 | `注意` |
+| alert_type | 必须 | 告警类型，如重试、阻塞、低置信、冲突 | `重试` |
+| alert_text | 必须 | 告警展示文案 | `脚本解析模块发生一次超时，已进入自动重试` |
+| related_agent | 可以缺省 | 关联agent | `JS解析agent` |
+| related_event_id | 可以缺省 | 关联事件标识 | `evt_001041` |
+| suggested_action | 可以缺省 | 建议动作 | `继续观察，无需人工介入` |
+
+### 1.9 `refresh_hints（刷新提示）` 参数设计
+
+    刷新提示用于指导前端如何更新界面，而不是每次都整页重拉。
+
+| 参数名 | 是否必须 | 参数解释 | 示例 |
+| --- | --- | --- | --- |
+| should_refresh_analysis | 必须 | 是否建议前端刷新分析层 | `true` |
+| should_refresh_timeline | 必须 | 是否建议刷新时间线 | `true` |
+| should_refresh_graph | 必须 | 是否建议刷新图谱相关视图 | `false` |
+| next_poll_after_ms | 必须 | 建议下次轮询间隔，单位毫秒 | `3000` |
+| refresh_reason | 可以缺省 | 触发刷新建议的原因 | `发现层新增有效资产，建议刷新分析层` |
+
+### 1.10 实时输出层完整示例
+
+```json
+{
+  "realtime_snapshot": {
+    "task_meta": {
+      "task_id": "task_20260408_0001",
+      "task_name": "华星科技外围资产梳理",
+      "task_mode": "标准模式",
+      "created_at": "2026-04-08T10:20:00+08:00",
+      "updated_at": "2026-04-08T10:31:10+08:00",
+      "requester": "user_admin"
+    },
+    "task_runtime_state": {
+      "current_state": "DISCOVERING（发现中）",
+      "current_stage": "发现",
+      "progress_percent": 32,
+      "stage_progress_percent": 57,
+      "status_text": "正在执行基础发现与指纹识别",
+      "is_blocked": false,
+      "block_reason": "",
+      "is_paused": false,
+      "retry_count": 1,
+      "error_count": 0,
+      "active_agent_count": 2,
+      "queued_agent_count": 3,
+      "waiting_signal": "等待事件"
+    },
+    "active_agents": [
+      {
+        "agent_run_id": "run_asset_0012",
+        "agent_name": "基础发现agent",
+        "agent_type": "asset_discovery",
+        "agent_state": "RUNNING（执行中）",
+        "start_time": "2026-04-08T10:29:14+08:00",
+        "last_heartbeat_at": "2026-04-08T10:31:05+08:00",
+        "current_action": "正在对主域及子域执行发现任务",
+        "current_target": "hxtech.com",
+        "progress_hint": "已完成 2/5 个子任务",
+        "risk_flag": "低"
+      },
+      {
+        "agent_run_id": "run_fp_0007",
+        "agent_name": "指纹识别agent",
+        "agent_type": "fingerprint",
+        "agent_state": "RUNNING（执行中）",
+        "start_time": "2026-04-08T10:30:00+08:00",
+        "last_heartbeat_at": "2026-04-08T10:31:03+08:00",
+        "current_action": "正在识别已发现页面的技术栈",
+        "current_target": "www.hxtech.com",
+        "progress_hint": "已完成首页指纹提取",
+        "risk_flag": "低"
+      }
+    ],
+    "recent_events": [
+      {
+        "event_id": "evt_001028",
+        "event_time": "2026-04-08T10:30:52+08:00",
+        "event_level": "信息",
+        "event_type": "DISCOVERY_BATCH_DONE（发现批次完成）",
+        "source_agent": "基础发现agent",
+        "event_text": "基础发现完成一批目标探测，新增 7 个候选子域",
+        "affects_state": true,
+        "related_target": "hxtech.com",
+        "next_hint": "已触发指纹识别继续处理"
+      }
+    ],
+    "runtime_alerts": [
+      {
+        "alert_id": "alert_0009",
+        "alert_level": "注意",
+        "alert_type": "重试",
+        "alert_text": "脚本解析模块发生一次超时，已进入自动重试",
+        "related_agent": "JS解析agent",
+        "related_event_id": "evt_001041",
+        "suggested_action": "继续观察，无需人工介入"
+      }
+    ],
+    "refresh_hints": {
+      "should_refresh_analysis": true,
+      "should_refresh_timeline": true,
+      "should_refresh_graph": false,
+      "next_poll_after_ms": 3000,
+      "refresh_reason": "发现层新增有效资产，建议刷新分析层"
+    }
+  }
+}
+```
+
 ## 2.分析层
+
+### 2.1 设计目标
+
+    分析层用于向前端提供“已经形成结构化结论的当前阶段成果”，其核心不是实时过程，而是当前可读、可比较、可筛选、可追踪的分析结果集合。
+
+    分析层主要回答以下问题：
+    1. 当前发现了哪些目标、实体、资产或线索；
+    2. 每条发现的置信度、来源和关联对象是什么；
+    3. 当前有哪些需要重点关注的高价值发现；
+    4. 发现之间存在怎样的关联关系；
+    5. 哪些结论已经确认，哪些仍然待复核。
+
+### 2.2 输出原则
+
+    分析层建议遵循以下原则：
+    1. 结构化优先：前端不应自己再从文本中抽字段；
+    2. 证据可追溯：每条分析结论必须能指向事件或证据引用；
+    3. 置信度明确：不允许把推断和确认混在一起；
+    4. 去重聚合：同类发现先归并，再返回前端；
+    5. 阶段可见：要让前端知道结果来自哪个阶段、哪个agent。
+
+### 2.3 输出结构
+
+    分析层建议统一输出为 `analysis_snapshot（分析快照）`，结构上至少包含以下七个对象：
+    1. `summary_metrics（汇总指标）`
+    2. `findings（发现列表）`
+    3. `key_entities（关键实体列表）`
+    4. `asset_overview（资产概览）`
+    5. `relation_hints（关联提示）`
+    6. `pending_reviews（待复核项）`
+    7. `source_refs（来源引用）`
+
+### 2.4 `summary_metrics（汇总指标）` 参数设计
+
+| 参数名 | 是否必须 | 参数解释 | 示例 |
+| --- | --- | --- | --- |
+| total_findings | 必须 | 当前已归并发现总数 | `28` |
+| confirmed_findings | 必须 | 已确认发现数量 | `17` |
+| suspected_findings | 必须 | 疑似发现数量 | `9` |
+| high_priority_findings | 必须 | 高优先级发现数量 | `4` |
+| reviewed_findings | 必须 | 已经复核通过的发现数量 | `6` |
+| pending_review_count | 必须 | 待复核发现数量 | `3` |
+| total_entities | 必须 | 已形成的实体数量 | `12` |
+| total_assets | 必须 | 已识别的资产数量 | `19` |
+| last_analysis_at | 必须 | 分析层最后更新时间 | `2026-04-08T10:33:42+08:00` |
+
+### 2.5 `findings（发现列表）` 参数设计
+
+    `findings（发现列表）` 是分析层的核心对象，建议列表内每条发现包含如下字段：
+
+| 参数名 | 是否必须 | 参数解释 | 示例 |
+| --- | --- | --- | --- |
+| finding_id | 必须 | 发现唯一标识 | `fd_00045` |
+| finding_type | 必须 | 发现类型，如企业信息、域名、端口、指纹、接口线索 | `域名发现` |
+| title | 必须 | 发现标题 | `发现 7 个可疑子域` |
+| summary | 必须 | 发现摘要 | `基础发现模块识别出 7 个与主域相关的候选子域，其中 3 个已确认可访问` |
+| confidence | 必须 | 置信度，范围 0~1 | `0.91` |
+| confidence_level | 必须 | 面向前端展示的置信等级 | `高` |
+| priority_level | 必须 | 当前优先级，如高、中、低 | `高` |
+| status | 必须 | 当前发现状态，如已确认、待复核、已忽略 | `已确认` |
+| stage | 必须 | 发现产生阶段 | `发现` |
+| source_agent | 必须 | 发现来源agent | `基础发现agent` |
+| related_targets | 可以缺省 | 关联目标列表 | `["hxtech.com","api.hxtech.com"]` |
+| evidence_refs | 可以缺省 | 证据引用列表 | `["evidence://http/1001","evidence://dns/2208"]` |
+| event_refs | 可以缺省 | 关联事件列表 | `["evt_001028"]` |
+| tags | 可以缺省 | 发现标签 | `["子域","可访问","需持续观察"]` |
+| discovered_at | 必须 | 首次发现时间 | `2026-04-08T10:30:52+08:00` |
+
+### 2.6 `key_entities（关键实体列表）` 参数设计
+
+| 参数名 | 是否必须 | 参数解释 | 示例 |
+| --- | --- | --- | --- |
+| entity_id | 必须 | 实体唯一标识 | `ent_0012` |
+| entity_type | 必须 | 实体类型，如企业、域名、IP、系统组件 | `企业` |
+| entity_name | 必须 | 实体名称 | `华星科技有限公司` |
+| entity_role | 可以缺省 | 实体角色，如主体、关联资产、候选实体 | `主体` |
+| confidence | 必须 | 实体归并后的置信度 | `0.96` |
+| related_finding_count | 必须 | 关联发现数量 | `8` |
+| related_asset_count | 可以缺省 | 关联资产数量 | `11` |
+| status | 必须 | 当前实体状态 | `已确认` |
+
+### 2.7 `asset_overview（资产概览）` 参数设计
+
+| 参数名 | 是否必须 | 参数解释 | 示例 |
+| --- | --- | --- | --- |
+| asset_id | 必须 | 资产唯一标识 | `asset_0088` |
+| asset_type | 必须 | 资产类型，如域名、URL、IP、服务端口 | `域名` |
+| asset_value | 必须 | 资产值 | `api.hxtech.com` |
+| asset_status | 必须 | 当前资产状态，如活跃、待确认、不可达 | `活跃` |
+| importance | 必须 | 资产重要级别 | `高` |
+| first_seen_at | 必须 | 首次发现时间 | `2026-04-08T10:30:10+08:00` |
+| last_seen_at | 可以缺省 | 最近确认时间 | `2026-04-08T10:33:05+08:00` |
+| source_agent | 必须 | 发现来源agent | `基础发现agent` |
+| related_entity_id | 可以缺省 | 关联主体实体 | `ent_0012` |
+
+### 2.8 `relation_hints（关联提示）` 参数设计
+
+    关联提示不是最终图谱输出，而是当前分析阶段已形成的可展示关系摘要。
+
+| 参数名 | 是否必须 | 参数解释 | 示例 |
+| --- | --- | --- | --- |
+| relation_id | 必须 | 关系标识 | `rel_0031` |
+| source_object | 必须 | 关系起点对象 | `华星科技有限公司` |
+| target_object | 必须 | 关系终点对象 | `api.hxtech.com` |
+| relation_type | 必须 | 关系类型 | `主体关联资产` |
+| confidence | 必须 | 关系置信度 | `0.88` |
+| relation_summary | 必须 | 关系摘要 | `该域名经发现与证据归并后，被识别为主体相关接口域名` |
+| source_refs | 可以缺省 | 支撑来源引用 | `["fd_00045","evt_001028"]` |
+
+### 2.9 `pending_reviews（待复核项）` 参数设计
+
+| 参数名 | 是否必须 | 参数解释 | 示例 |
+| --- | --- | --- | --- |
+| review_item_id | 必须 | 待复核项标识 | `rv_0011` |
+| review_type | 必须 | 复核类型，如低置信、冲突、推断性强 | `低置信` |
+| review_title | 必须 | 复核项标题 | `疑似后台管理子域待确认` |
+| review_reason | 必须 | 进入复核的原因 | `证据不足但价值较高，暂不直接确认` |
+| related_finding_id | 可以缺省 | 关联发现标识 | `fd_00052` |
+| suggested_action | 可以缺省 | 建议动作 | `等待指纹识别与后续事件补证` |
+| created_at | 必须 | 进入待复核时间 | `2026-04-08T10:33:21+08:00` |
+
+### 2.10 `source_refs（来源引用）` 参数设计
+
+| 参数名 | 是否必须 | 参数解释 | 示例 |
+| --- | --- | --- | --- |
+| ref_id | 必须 | 来源引用标识 | `src_evt_001028` |
+| ref_type | 必须 | 引用类型，如事件、证据、agent运行记录 | `事件` |
+| ref_target | 必须 | 引用目标 | `evt_001028` |
+| ref_summary | 必须 | 引用摘要 | `基础发现完成一批子域探测` |
+
+### 2.11 分析层完整示例
+
+```json
+{
+  "analysis_snapshot": {
+    "summary_metrics": {
+      "total_findings": 28,
+      "confirmed_findings": 17,
+      "suspected_findings": 9,
+      "high_priority_findings": 4,
+      "reviewed_findings": 6,
+      "pending_review_count": 3,
+      "total_entities": 12,
+      "total_assets": 19,
+      "last_analysis_at": "2026-04-08T10:33:42+08:00"
+    },
+    "findings": [
+      {
+        "finding_id": "fd_00045",
+        "finding_type": "域名发现",
+        "title": "发现 7 个可疑子域",
+        "summary": "基础发现模块识别出 7 个与主域相关的候选子域，其中 3 个已确认可访问",
+        "confidence": 0.91,
+        "confidence_level": "高",
+        "priority_level": "高",
+        "status": "已确认",
+        "stage": "发现",
+        "source_agent": "基础发现agent",
+        "related_targets": [
+          "hxtech.com",
+          "api.hxtech.com"
+        ],
+        "evidence_refs": [
+          "evidence://http/1001",
+          "evidence://dns/2208"
+        ],
+        "event_refs": [
+          "evt_001028"
+        ],
+        "tags": [
+          "子域",
+          "可访问",
+          "需持续观察"
+        ],
+        "discovered_at": "2026-04-08T10:30:52+08:00"
+      }
+    ],
+    "key_entities": [
+      {
+        "entity_id": "ent_0012",
+        "entity_type": "企业",
+        "entity_name": "华星科技有限公司",
+        "entity_role": "主体",
+        "confidence": 0.96,
+        "related_finding_count": 8,
+        "related_asset_count": 11,
+        "status": "已确认"
+      }
+    ],
+    "asset_overview": [
+      {
+        "asset_id": "asset_0088",
+        "asset_type": "域名",
+        "asset_value": "api.hxtech.com",
+        "asset_status": "活跃",
+        "importance": "高",
+        "first_seen_at": "2026-04-08T10:30:10+08:00",
+        "last_seen_at": "2026-04-08T10:33:05+08:00",
+        "source_agent": "基础发现agent",
+        "related_entity_id": "ent_0012"
+      }
+    ],
+    "relation_hints": [
+      {
+        "relation_id": "rel_0031",
+        "source_object": "华星科技有限公司",
+        "target_object": "api.hxtech.com",
+        "relation_type": "主体关联资产",
+        "confidence": 0.88,
+        "relation_summary": "该域名经发现与证据归并后，被识别为主体相关接口域名",
+        "source_refs": [
+          "fd_00045",
+          "evt_001028"
+        ]
+      }
+    ],
+    "pending_reviews": [
+      {
+        "review_item_id": "rv_0011",
+        "review_type": "低置信",
+        "review_title": "疑似后台管理子域待确认",
+        "review_reason": "证据不足但价值较高，暂不直接确认",
+        "related_finding_id": "fd_00052",
+        "suggested_action": "等待指纹识别与后续事件补证",
+        "created_at": "2026-04-08T10:33:21+08:00"
+      }
+    ],
+    "source_refs": [
+      {
+        "ref_id": "src_evt_001028",
+        "ref_type": "事件",
+        "ref_target": "evt_001028",
+        "ref_summary": "基础发现完成一批子域探测"
+      }
+    ]
+  }
+}
+```
+
+### 2.12 落地约束
+
+    为保证分析层长期稳定，建议固定以下约束：
+    1. 分析层只返回已结构化的聚合结果，不返回长篇原始文本；
+    2. 每条发现必须附带置信度、来源agent和至少一种引用；
+    3. 分析层中的“已确认”和“待复核”必须严格区分；
+    4. 同一对象的重复发现应先归并，再对前端输出；
+    5. 分析层刷新应受实时输出层中的 `refresh_hints（刷新提示）` 控制，避免无意义重复请求。
 
 # 八、任务能力路由分解设计
 
+## 1.设计目标
+
+    任务能力路由分解，是总控agent把“用户任务”转化为“可执行多agent计划”的核心步骤。它解决的不是简单的模块映射问题，而是以下四个问题：
+    1. 用户当前任务应该拆成哪些阶段和子任务；
+    2. 每个子任务应该由哪个agent处理；
+    3. 哪些agent需要立即启动，哪些应条件触发，哪些必须跳过；
+    4. 当结果返回后，是否要补跑、加派、降级或升级复核。
+
+    因此，第八部分的核心目标是建立一套“可解释、可配置、可追踪、可落地”的任务能力路由机制，使总控agent不依赖临场自由发挥，而是依据输入、边界、契约、事件和规则来完成路由拆解。
+
+## 2.路由分解总体逻辑
+
+### 2.1 总体流程
+
+    总控agent的路由分解建议固定为六步：
+    1. 输入识别：读取 `normalized_input（标准化输入）` 与 `boundary_input（边界鉴定输入）`；
+    2. 意图拆解：把任务目标拆成若干能力需求；
+    3. 阶段映射：将能力需求挂到状态机阶段；
+    4. agent路由：为每项能力需求匹配最合适的agent；
+    5. 依赖排序：根据前置依赖生成执行顺序与条件触发关系；
+    6. 路由输出：生成可执行的路由计划，供调度器直接消费。
+
+### 2.2 路由判断优先级
+
+    为避免多个规则同时命中导致混乱，建议按以下优先级进行路由判断：
+    1. 边界限制优先：超出边界的模块直接禁止；
+    2. 任务目标优先：先满足核心目标，再考虑增强模块；
+    3. 明确输入优先：用户明确指定的目标与意图优先于推断；
+    4. 低成本优先：在多个可选路径都成立时，优先选择成本更低的路径；
+    5. 证据增益优先：只有能显著增加信息增益的补跑或加派才执行。
+
+### 2.3 路由结果类型
+
+    路由结果建议拆成四类：
+    1. 直接路由：任务创建后立即生成并调度；
+    2. 条件路由：满足某事件或阈值后才调度；
+    3. 禁止路由：受边界、契约或策略限制而不允许调度；
+    4. 升级路由：当出现高风险、低置信或冲突结论时，升级到复核链路。
+
+## 3.任务分解逻辑
+
+### 3.1 一级分解：按任务目标分解
+
+    第一级分解要先回答“用户到底要做哪类事”。建议总控agent固定把任务拆到以下能力域：
+    1. 企业情报；
+    2. 资产发现；
+    3. 应用分析；
+    4. 图谱聚合；
+    5. 价值评估；
+    6. 复核与质量控制。
+
+    例如：
+    1. 若任务目标是“企业背景整理”，优先落到企业情报能力域；
+    2. 若任务目标是“外围资产盘点”，优先落到资产发现能力域；
+    3. 若任务目标是“接口、参数、隐藏路径分析”，优先落到应用分析能力域；
+    4. 若任务目标是“关系梳理与关联理解”，优先落到图谱聚合能力域；
+    5. 若任务目标是“高价值资产优先排序”，优先落到价值评估能力域。
+
+### 3.2 二级分解：按阶段分解
+
+    当一级能力域确定后，再将其映射到任务状态机阶段，建议固定映射如下：
+
+| 阶段名称 | 阶段作用 | 典型输入 | 典型输出 |
+| --- | --- | --- | --- |
+| 界定范围 | 确认主体、目标、边界、禁用项 | 标准化输入、边界输入 | 范围确认结果 |
+| 发现 | 发现域名、地址、路径、候选资产 | 主目标、词典、种子目标 | 资产发现结果 |
+| 分析 | 识别指纹、脚本线索、文件线索 | 页面、响应、脚本、文件 | 结构化线索 |
+| 扩展 | 基于新线索进行补充发现或字典扩展 | 发现结果、分析结果 | 扩展资产与新词典 |
+| 关联 | 将实体、资产、线索进行归并与关联 | 多源结果 | 关系摘要 |
+| 优先级判定 | 计算优先级与关注顺序 | 资产、关系、风险线索 | 优先级列表 |
+| 评审 | 处理低置信、冲突、高风险结论 | 争议发现、冲突线索 | 复核结论 |
+
+### 3.3 三级分解：按agent能力分解
+
+    在阶段内部，再把能力域细分到具体agent。建议映射如下：
+    1. 企业主体、股东、备案、历史变更，分配给企业情报agent；
+    2. 子域、IP、端口、基础路径，分配给基础发现agent；
+    3. 页面技术栈、中间件、CMS 指纹，分配给指纹识别agent；
+    4. JS 接口、参数、隐藏路径、外联域名，分配给 JS 解析agent；
+    5. 新词生成、路径扩展、增量扫描词典，分配给扩展词典agent；
+    6. 实体归并、资产关联、拓扑关系，分配给图谱聚合agent；
+    7. 高价值资产排序、优先级标注，分配给价值评估agent；
+    8. 高风险、低置信、冲突结论，分配给复核agent；
+    9. 文件下载、文本抽取、敏感内容线索，分配给文件情报agent；
+    10. 流量样本中的风险线索，分配给流量审查agent；
+    11. 推断性链路提示，分配给链路提示agent。
+
+## 4.路由实现方案
+
+### 4.1 路由输入对象设计
+
+    为使路由器能够稳定工作，建议总控agent统一向路由器输入 `routing_input（路由输入）` 对象。
+
+| 参数名 | 是否必须 | 参数注释 | 示例 |
+| --- | --- | --- | --- |
+| task_id | 必须 | 当前任务标识 | `task_20260408_0001` |
+| normalized_subject | 必须 | 标准化后的主体 | `华星科技有限公司` |
+| primary_target | 必须 | 主目标 | `hxtech.com` |
+| target_types | 必须 | 目标类型集合 | `["企业","域名"]` |
+| intent_tags | 必须 | 任务意图标签 | `["企业情报","资产发现"]` |
+| execution_profile | 必须 | 执行画像 | `surface_scan` |
+| allowed_modules | 必须 | 明确允许的模块集合 | `["企业情报模块","基础发现模块","指纹识别模块"]` |
+| denied_modules | 必须 | 明确禁止的模块集合 | `["流量审查模块","文件情报模块"]` |
+| conditional_modules | 可以缺省 | 条件模块及其触发说明 | 见下方示例 |
+| task_contract_ref | 必须 | 任务契约引用 | `contract_20260408_0001` |
+
+### 4.2 路由规则对象设计
+
+    路由器不应把规则散落在 prompt 中，建议统一维护 `routing_rule（路由规则）`。
+
+| 参数名 | 是否必须 | 参数注释 | 示例 |
+| --- | --- | --- | --- |
+| rule_id | 必须 | 路由规则唯一标识 | `rule_asset_discovery_01` |
+| rule_name | 必须 | 规则名称 | `资产发现基础路由规则` |
+| match_conditions | 必须 | 命中条件列表 | `["intent_tags 包含 资产发现","target_types 包含 域名"]` |
+| route_to_agent | 必须 | 命中的目标agent | `基础发现agent` |
+| route_stage | 必须 | 应进入的阶段 | `发现` |
+| priority | 必须 | 规则优先级，数值越大优先级越高 | `90` |
+| block_conditions | 可以缺省 | 阻断条件列表 | `["denied_modules 包含 基础发现模块"]` |
+| output_task_type | 必须 | 生成的子任务类型 | `asset_seed_discovery` |
+| note | 可以缺省 | 规则说明 | `适用于主域、子域、外围资产盘点任务` |
+
+### 4.3 路由计划对象设计
+
+    路由器输出建议统一为 `routing_plan（路由计划）`。
+
+| 参数名 | 是否必须 | 参数注释 | 示例 |
+| --- | --- | --- | --- |
+| plan_id | 必须 | 路由计划标识 | `route_plan_20260408_001` |
+| task_id | 必须 | 所属任务标识 | `task_20260408_0001` |
+| direct_routes | 必须 | 直接调度的路由项列表 | 见下方示例 |
+| conditional_routes | 可以缺省 | 条件调度的路由项列表 | 见下方示例 |
+| blocked_routes | 可以缺省 | 被阻止的路由项列表 | 见下方示例 |
+| review_routes | 可以缺省 | 复核路由项列表 | 见下方示例 |
+| generated_at | 必须 | 路由计划生成时间 | `2026-04-08T10:23:02+08:00` |
+
+### 4.4 路由项对象设计
+
+    无论是直接路由、条件路由还是阻止路由，建议统一使用 `route_item（路由项）` 子结构。
+
+| 参数名 | 是否必须 | 参数注释 | 示例 |
+| --- | --- | --- | --- |
+| route_id | 必须 | 路由项唯一标识 | `route_0001` |
+| route_type | 必须 | 路由类型，如 direct、conditional、blocked、review | `direct` |
+| stage | 必须 | 所属阶段 | `发现` |
+| capability | 必须 | 当前路由对应的能力项 | `子域与基础资产发现` |
+| target_agent | 必须 | 命中的目标agent | `基础发现agent` |
+| input_ref | 必须 | 输入引用，供agent任务读取 | `routing_input.primary_target` |
+| dependency_routes | 可以缺省 | 前置依赖路由项 | `[]` |
+| trigger_condition | 可以缺省 | 条件触发说明 | `发现阶段识别到大量JS资源后触发` |
+| route_reason | 必须 | 路由原因说明 | `任务意图包含资产发现，且主目标为域名` |
+| priority | 必须 | 调度优先级 | `95` |
+| status | 必须 | 路由状态，如 ready、waiting、blocked | `ready` |
+
+## 5.路由拆解的具体实现逻辑
+
+### 5.1 规则匹配流程
+
+    路由规则匹配建议按以下顺序执行：
+    1. 读取任务契约中的允许模块和禁止模块；
+    2. 根据 `intent_tags（意图标签）` 选出候选能力域；
+    3. 根据 `target_types（目标类型）` 与 `primary_target（主目标）` 收窄规则集合；
+    4. 对规则按 `priority（优先级）` 排序；
+    5. 逐条校验阻断条件；
+    6. 命中后生成路由项；
+    7. 对重复能力项去重，保留最高优先级路由。
+
+### 5.2 阶段内依赖处理
+
+    路由器不能只决定“给谁”，还要决定“先后顺序”。建议固定以下依赖规则：
+    1. 企业情报agent可与基础发现agent并行；
+    2. 指纹识别agent依赖基础发现产生的页面或服务结果；
+    3. JS 解析agent依赖页面抓取或脚本资源结果；
+    4. 扩展词典agent依赖企业情报、指纹识别或 JS 解析的新增线索；
+    5. 图谱聚合agent依赖多个阶段结果沉淀后再执行；
+    6. 价值评估agent依赖资产与关系结果；
+    7. 复核agent依赖争议结果，不参与初始发现链路。
+
+### 5.3 条件触发逻辑
+
+    对高成本模块，不建议在任务开始时统一下发，而应采用条件触发：
+    1. 当发现阶段输出“JS 资源数超过阈值”时，生成 JS 解析路由；
+    2. 当 JS 解析输出“新域名 / 新路径 / 文件线索”时，生成扩展词典或文件情报路由；
+    3. 当分析阶段发现“高价值低置信结论”时，生成复核路由；
+    4. 当图谱聚合阶段发现“关系缺口较大”时，可生成链路提示路由。
+
+### 5.4 禁止与跳过逻辑
+
+    路由器必须明确记录为什么没有调度某个agent，建议分为三种情况：
+    1. `blocked（被阻止）`：被边界或契约明确禁止；
+    2. `skipped（被跳过）`：当前任务目标不需要；
+    3. `deferred（延后）`：当前阶段尚未满足依赖。
+
+    这样可以避免后续排查时只看到“没执行”，却不知道是“不能做”还是“暂时没做”。
+
+## 6.完整示例
+
+### 6.1 路由输入示例
+
+```json
+{
+  "routing_input": {
+    "task_id": "task_20260408_0001",
+    "normalized_subject": "华星科技有限公司",
+    "primary_target": "hxtech.com",
+    "target_types": [
+      "企业",
+      "域名"
+    ],
+    "intent_tags": [
+      "企业情报",
+      "资产发现"
+    ],
+    "execution_profile": "surface_scan",
+    "allowed_modules": [
+      "企业情报模块",
+      "基础发现模块",
+      "指纹识别模块"
+    ],
+    "denied_modules": [
+      "流量审查模块",
+      "文件情报模块"
+    ],
+    "conditional_modules": [
+      {
+        "module_name": "脚本解析模块",
+        "trigger_condition": "发现阶段识别到 20 个以上 JS 资源"
+      }
+    ],
+    "task_contract_ref": "contract_20260408_0001"
+  }
+}
+```
+
+### 6.2 路由规则示例
+
+```json
+{
+  "routing_rule": {
+    "rule_id": "rule_asset_discovery_01",
+    "rule_name": "资产发现基础路由规则",
+    "match_conditions": [
+      "intent_tags 包含 资产发现",
+      "target_types 包含 域名"
+    ],
+    "route_to_agent": "基础发现agent",
+    "route_stage": "发现",
+    "priority": 90,
+    "block_conditions": [
+      "denied_modules 包含 基础发现模块"
+    ],
+    "output_task_type": "asset_seed_discovery",
+    "note": "适用于主域和外围资产盘点"
+  }
+}
+```
+
+### 6.3 路由计划示例
+
+```json
+{
+  "routing_plan": {
+    "plan_id": "route_plan_20260408_001",
+    "task_id": "task_20260408_0001",
+    "direct_routes": [
+      {
+        "route_id": "route_0001",
+        "route_type": "direct",
+        "stage": "界定范围",
+        "capability": "企业主体与基础范围确认",
+        "target_agent": "企业情报agent",
+        "input_ref": "routing_input.normalized_subject",
+        "dependency_routes": [],
+        "trigger_condition": "",
+        "route_reason": "任务意图包含企业情报，且主体已明确",
+        "priority": 100,
+        "status": "ready"
+      },
+      {
+        "route_id": "route_0002",
+        "route_type": "direct",
+        "stage": "发现",
+        "capability": "子域与基础资产发现",
+        "target_agent": "基础发现agent",
+        "input_ref": "routing_input.primary_target",
+        "dependency_routes": [],
+        "trigger_condition": "",
+        "route_reason": "任务意图包含资产发现，主目标为域名",
+        "priority": 95,
+        "status": "ready"
+      },
+      {
+        "route_id": "route_0003",
+        "route_type": "direct",
+        "stage": "分析",
+        "capability": "页面指纹与技术栈识别",
+        "target_agent": "指纹识别agent",
+        "input_ref": "route_0002.output",
+        "dependency_routes": [
+          "route_0002"
+        ],
+        "trigger_condition": "",
+        "route_reason": "指纹识别依赖发现阶段产出的页面和服务结果",
+        "priority": 88,
+        "status": "waiting"
+      }
+    ],
+    "conditional_routes": [
+      {
+        "route_id": "route_0004",
+        "route_type": "conditional",
+        "stage": "分析",
+        "capability": "脚本语义分析",
+        "target_agent": "JS解析agent",
+        "input_ref": "route_0002.output",
+        "dependency_routes": [
+          "route_0002"
+        ],
+        "trigger_condition": "发现阶段识别到 20 个以上 JS 资源",
+        "route_reason": "脚本解析模块被定义为条件模块，当前不直接启动",
+        "priority": 75,
+        "status": "waiting"
+      }
+    ],
+    "blocked_routes": [
+      {
+        "route_id": "route_0005",
+        "route_type": "blocked",
+        "stage": "分析",
+        "capability": "流量样本审查",
+        "target_agent": "流量审查agent",
+        "input_ref": "",
+        "dependency_routes": [],
+        "trigger_condition": "",
+        "route_reason": "任务契约明确禁止流量审查模块",
+        "priority": 0,
+        "status": "blocked"
+      }
+    ],
+    "review_routes": [
+      {
+        "route_id": "route_0006",
+        "route_type": "review",
+        "stage": "评审",
+        "capability": "低置信高价值发现复核",
+        "target_agent": "复核agent",
+        "input_ref": "pending_reviews",
+        "dependency_routes": [],
+        "trigger_condition": "出现高价值但低置信发现时触发",
+        "route_reason": "复核链路不在初始调度中，而由争议结果触发",
+        "priority": 98,
+        "status": "waiting"
+      }
+    ],
+    "generated_at": "2026-04-08T10:23:02+08:00"
+  }
+}
+```
+
+## 7.落地约束
+
+    为保证任务能力路由长期稳定，建议固定以下约束：
+    1. 路由器只能读取标准化输入、边界输入、任务契约和事件结果，不直接读取前端原始表单；
+    2. 路由规则必须显式配置，不能只依赖大模型临场判断；
+    3. 所有被阻止、跳过、延后、升级的路由都必须留痕；
+    4. 同一能力项若被多个规则命中，应只保留一个最终路由结果；
+    5. 条件模块的触发必须依赖事件或阈值，不能无限补跑；
+    6. 任意新增agent时，都必须补充其能力项、输入要求、阶段位置和依赖关系，才能纳入正式路由。
 
 # 九、状态存储管理设计
+
+## 1.设计目标
+
+    状态存储管理的目标，不是简单记录“当前任务进行到哪里”，而是要同时解决以下问题：
+    1. 总控agent当前处于什么状态；
+    2. 为什么会进入这个状态；
+    3. 是由哪个事件、哪个agent、哪个操作触发的；
+    4. 出现异常时，能否回放、重建、审计；
+    5. 前端查询时，能否快速得到稳定一致的任务快照。
+
+    因此本部分采用“事件驱动（Event-Driven，事件驱动）+ 状态快照（Snapshot，快照）+ 状态流转日志（State Transition Log，状态流转日志）”的组合设计。核心原则是：
+    1. 状态推进以事件为准，不以页面显示结果为准；
+    2. 当前状态可以缓存，但缓存不是唯一真相；
+    3. 每一次状态变化都必须可追溯到具体触发原因；
+    4. 任一任务都必须支持回放、重建、审计和故障恢复。
+
+## 2.状态管理总体模型
+
+### 2.1 三层状态视图
+
+    为避免“写库一套、前端一套、调度器一套”的状态割裂，建议总控agent统一维护三层状态视图：
+    1. 任务真实状态层：由事件流和状态流转日志共同定义，是系统唯一事实来源；
+    2. 当前查询状态层：由任务主表中的当前状态字段和快照表提供，服务于前端和接口查询；
+    3. 运行时控制状态层：由调度器、队列和agent执行器维护，服务于调度与故障控制。
+
+    三层关系如下：
+    1. 真实状态层决定“状态是什么”；
+    2. 查询状态层决定“状态怎么高效读出来”；
+    3. 运行时控制状态层决定“状态下一步怎么推进”。
+
+### 2.2 全局任务状态集合
+
+    总控agent的全局任务状态固定为以下集合，并作为数据库枚举或常量表统一管理：
+    1.`CREATED（已创建）`
+    2. `SCOPED（已界定范围）`
+    3. `DISCOVERING（发现中）`
+    4. `ANALYZING（分析中）`
+    5. `EXPANDING（扩展中）`
+    6. `CORRELATING（关联中）`
+    7. `PRIORITIZING（优先级判定中）`
+    8. `REPORTING（报告生成中）`
+    9. `REVIEWING（复核中）`
+    10. `DONE（已完成）`
+    11. `RETRYING（重试中）`
+    12. `PAUSED（已暂停）`
+    13. `PARTIAL_DONE（部分完成）`
+    14. `FAILED（失败）`
+    15. `QUARANTINED（隔离中）`
+
+    其中：
+    1. 前十项属于主流程状态；
+    2. 后五项属于旁路控制状态；
+    3. 状态机只允许按预定义规则跳转，不允许任意跨阶段写入。
+
+### 2.3 单个agent运行状态集合
+
+    每个agent执行实例建议单独维护运行状态，用于区分“任务卡住”与“某个agent还在跑”：
+    1.`PENDING（待领取）`
+    2. `CLAIMED（已领取）`
+    3. `RUNNING（执行中）`
+    4. `WAIT_TOOL（等待工具）`
+    5. `WAIT_EVENT（等待事件）`
+    6. `SELF_CHECK（自检中）`
+    7. `DONE（完成）`
+    8. `RETRY（待重试）`
+    9. `FAILED（失败）`
+    10. `ESCALATED（已升级复核）`
+    11. `CANCELLED（已取消）`
+
+## 3.状态存储对象设计
+
+### 3.1 核心存储对象
+
+    状态管理建议至少拆分以下七类核心对象，分别承担不同职责：
+
+| 对象名                                   | 作用                                    | 存储建议                   | 说明                           |
+| ---------------------------------------- | --------------------------------------- | -------------------------- | ------------------------------ |
+| `tasks（任务主表）`                    | 保存任务当前态、当前阶段、主视图字段    | PostgreSQL（关系型数据库） | 面向查询的当前任务入口         |
+| `task_state_transitions（状态流转表）` | 记录每次状态变化                        | PostgreSQL（关系型数据库） | 面向审计与重建                 |
+| `observation_events（观察事件表）`     | 记录agent、工具、人工动作产生的标准事件 | PostgreSQL（关系型数据库） | 是状态推进的原始依据           |
+| `agent_runs（agent执行表）`            | 记录每次agent执行实例                   | PostgreSQL（关系型数据库） | 用于定位执行耗时、失败原因     |
+| `task_snapshots（任务快照表）`         | 保存前端直接查询的聚合结果              | PostgreSQL（关系型数据库） | 避免每次现算                   |
+| `context_capsules（上下文胶囊表）`     | 保存阶段摘要和可复用上下文              | PostgreSQL（关系型数据库） | 用于恢复和阶段切换             |
+| `state_runtime_cache（状态运行缓存）`  | 保存短期锁、去重键、心跳、租约          | Redis（内存键值库）        | 面向高频调度，不作为最终事实源 |
+
+### 3.2 任务主表 `tasks（任务主表）` 建议字段
+
+| 字段名            | 是否必须 | 说明                       | 示例                          |
+| ----------------- | -------- | -------------------------- | ----------------------------- |
+| task_id           | 必须     | 任务唯一标识               | `task_20260408_0001`        |
+| current_state     | 必须     | 当前全局状态               | `DISCOVERING（发现中）`     |
+| current_stage     | 必须     | 当前阶段中文名             | `发现`                      |
+| state_version     | 必须     | 状态版本号，每次流转递增   | `6`                         |
+| task_contract_ref | 必须     | 任务契约引用               | `contract_20260408_0001`    |
+| latest_event_id   | 可以缺省 | 最近一次成功消费的事件标识 | `evt_001028`                |
+| snapshot_id       | 可以缺省 | 当前快照引用               | `snap_000117`               |
+| progress_percent  | 可以缺省 | 任务进度百分比             | `35`                        |
+| risk_level        | 可以缺省 | 当前风险等级               | `中`                        |
+| created_at        | 必须     | 创建时间                   | `2026-04-08T10:20:00+08:00` |
+| updated_at        | 必须     | 最后更新时间               | `2026-04-08T10:36:10+08:00` |
+
+### 3.3 状态流转表 `task_state_transitions（状态流转表）` 建议字段
+
+| 字段名            | 是否必须 | 说明                                     | 示例                             |
+| ----------------- | -------- | ---------------------------------------- | -------------------------------- |
+| transition_id     | 必须     | 流转记录唯一标识                         | `tr_000981`                    |
+| task_id           | 必须     | 所属任务                                 | `task_20260408_0001`           |
+| from_state        | 必须     | 流转前状态                               | `SCOPED（已界定范围）`         |
+| to_state          | 必须     | 流转后状态                               | `DISCOVERING（发现中）`        |
+| trigger_type      | 必须     | 触发类型，如事件触发、人工触发、系统恢复 | `event（事件）`                |
+| trigger_ref       | 必须     | 触发对象引用                             | `evt_001028`                   |
+| operator_type     | 必须     | 操作来源，如系统、agent、人工            | `system（系统）`               |
+| operator_id       | 可以缺省 | 操作来源标识                             | `orchestrator_agent`           |
+| transition_reason | 必须     | 流转原因说明                             | `基础发现任务已成功下发并启动` |
+| transition_at     | 必须     | 流转时间                                 | `2026-04-08T10:25:13+08:00`    |
+
+### 3.4 观察事件表 `observation_events（观察事件表）` 建议字段
+
+| 字段名       | 是否必须 | 说明                                 | 示例                                                       |
+| ------------ | -------- | ------------------------------------ | ---------------------------------------------------------- |
+| event_id     | 必须     | 事件唯一标识                         | `evt_001028`                                             |
+| task_id      | 必须     | 所属任务                             | `task_20260408_0001`                                     |
+| agent_id     | 可以缺省 | 事件来源agent                        | `asset_discovery_agent`                                  |
+| event_type   | 必须     | 事件类型                             | `DISCOVERY_BATCH_DONE（发现批次完成）`                   |
+| event_scope  | 必须     | 事件作用域，如任务级、阶段级、目标级 | `stage（阶段级）`                                        |
+| payload_ref  | 可以缺省 | 事件负载引用                         | `payload://event/1028`                                   |
+| evidence_ref | 可以缺省 | 证据引用                             | `evidence://html/7782`                                   |
+| confidence   | 可以缺省 | 置信度                               | `0.93`                                                   |
+| dedupe_key   | 必须     | 去重键                               | `task_20260408_0001:asset_discovery:batch_done:hash_xxx` |
+| event_status | 必须     | 事件消费状态                         | `consumed（已消费）`                                     |
+| created_at   | 必须     | 事件产生时间                         | `2026-04-08T10:25:07+08:00`                              |
+
+## 4.状态管理实现方式
+
+### 4.1 状态推进采用“事件驱动更新 + 快照查询”
+
+    状态推进不建议由前端轮询后自行猜测，也不建议由任意agent直接改写任务当前状态。正确实现方式如下：
+    1. agent、工具适配器、人工动作先产出标准事件；
+    2. 事件统一写入`observation_events（观察事件表）`；
+    3. 总控agent中的状态处理器读取事件并校验是否合法；
+    4. 若满足状态转移规则，则写入 `task_state_transitions（状态流转表）`；
+    5. 同时更新 `tasks（任务主表）` 的 `current_state`、`current_stage`、`state_version`；
+    6. 异步或同步刷新 `task_snapshots（任务快照表）`，供前端查询。
+
+    也就是说：
+    1. 事件是“为什么变”；
+    2. 流转表是“怎么变”；
+    3. 主表是“现在是什么”；
+    4. 快照是“对前端怎么展示”。
+
+### 4.2 状态处理器实现建议
+
+    建议在总控agent内部实现独立的状态处理器`StateReducer（状态归并器）`，职责如下：
+    1. 接收事件；
+    2. 判断该事件是否重复；
+    3. 判断该事件是否允许触发当前状态跳转；
+    4. 生成新的状态流转记录；
+    5. 更新任务当前状态；
+    6. 触发快照重建与下游调度。
+
+    `StateReducer（状态归并器）` 不应由各个agent各自实现，而应由总控agent统一维护。这样可以避免：
+    1. 不同agent对同一状态含义理解不一致；
+    2. 出现非法跨阶段流转；
+    3. 出现“事件已落库但状态没更新”或“状态更新了但没有证据”的不一致问题。
+
+### 4.3 状态转移规则实现建议
+
+    建议维护一份显式状态转移表`State Transition Matrix（状态转移矩阵）`，以配置或常量形式定义允许的流转关系。例如：
+    1. `CREATED（已创建） -> SCOPED（已界定范围）`
+    2. `SCOPED（已界定范围） -> DISCOVERING（发现中）`
+    3. `DISCOVERING（发现中） -> ANALYZING（分析中）`
+    4. 任意主流程状态 -> `PAUSED（已暂停）`
+    5. 任意主流程状态 -> `FAILED（失败）`
+    6. 高风险结论阶段 -> `REVIEWING（复核中）`
+
+    每次流转前必须校验：
+    1. 当前状态是否合法；
+    2. 目标状态是否合法；
+    3. 触发事件是否匹配；
+    4. 是否满足前置依赖；
+    5. 是否存在更高优先级的阻断状态，如`QUARANTINED（隔离中）`。
+
+### 4.4 一致性实现建议
+
+    为降低“事件写入成功但状态没改”或“状态改了但快照没更新”的问题，建议将以下操作放入同一数据库事务`Transaction（事务）` 中执行：
+    1. 写入状态流转记录；
+    2. 更新任务主表当前状态；
+    3. 记录最近消费事件标识；
+    4. 写入必要的审计字段。
+
+    `task_snapshots（任务快照表）` 的刷新可根据性能选择：
+    1. 同步更新：适合低并发，查询一致性更强；
+    2. 异步更新：适合高并发，通过事件补偿保证最终一致。
+
+    但无论采用哪种模式，主表状态与流转表必须先一致，快照只能延迟，不能与事实层冲突。
+
+## 5.状态追踪设计
+
+### 5.1 追踪目标
+
+    状态追踪要解决三个问题：
+    1. 我们如何知道任务现在卡在哪里；
+    2. 我们如何知道是谁让任务进入这个状态；
+    3. 我们如何知道从开始到现在完整发生了什么。
+
+    因此，状态追踪至少覆盖以下链路：
+    1. 任务追踪；
+    2. 阶段追踪；
+    3. agent追踪；
+    4. 事件追踪；
+    5. 人工操作追踪；
+    6. 错误与重试追踪。
+
+### 5.2 任务级追踪
+
+    任务级追踪面向“一个任务从创建到结束的生命周期”：
+    1. 记录任务创建时间、最后活跃时间、当前状态、当前阶段；
+    2. 记录最近一次流转原因；
+    3. 记录当前是否被阻塞、暂停、失败或隔离；
+    4. 记录累计执行耗时、累计重试次数、累计失败次数；
+    5. 记录当前活跃agent数量与待执行agent数量。
+
+### 5.3 事件级追踪
+
+    事件级追踪面向“任务为什么会变化”：
+    1. 每个事件必须带`event_id（事件标识）`；
+    2. 每个事件必须带 `task_id（任务标识）`；
+    3. 每个事件必须带 `agent_id（agent标识）` 或人工来源；
+    4. 每个事件必须带 `dedupe_key（去重键）`，防止重复消费；
+    5. 每个事件必须带 `payload_ref（负载引用）` 或 `evidence_ref（证据引用）`。
+
+    通过这五个字段，可以从一个任务状态追溯到：
+    1. 哪个agent产生了事件；
+    2. 该事件引用了什么证据；
+    3. 该事件是否被重复消费；
+    4. 该事件是否真正触发了状态流转。
+
+### 5.4 状态时间线设计
+
+    建议对外提供统一的状态时间线`Timeline（时间线）` 视图，供前端和排障使用。每条时间线记录建议包含：
+    1. 时间；
+    2. 所处状态；
+    3. 触发来源；
+    4. 触发说明；
+    5. 关联agent；
+    6. 关联事件；
+    7. 是否异常；
+    8. 是否需要人工关注。
+
+    这样前端就不需要自己拼接底层事件，只需读取任务快照和时间线即可稳定展示任务过程。
+
+### 5.5 审计与回放设计
+
+    状态追踪必须支持回放`Replay（回放）`。建议实现方式如下：
+    1. 读取某任务的全部 `observation_events（观察事件表）`；
+    2. 按事件时间和消费顺序重放；
+    3. 根据 `task_state_transitions（状态流转表）` 校验每一步是否合法；
+    4. 如主表状态与回放结果不一致，以流转表和事件表为准进行修复；
+    5. 将修复过程写入审计日志 `Audit Log（审计日志）`。
+
+    这意味着：
+    1. 主表状态可以修；
+    2. 快照可以重建；
+    3. 事件和流转日志不能被静默篡改；
+    4. 任何人工修正也必须留下日志。
+
+## 6.故障恢复与排障设计
+
+### 6.1 异常场景
+
+    状态管理至少要覆盖以下异常场景：
+    1. 事件重复写入；
+    2. 状态重复流转；
+    3. agent执行超时但任务未回收；
+    4. 主表状态与快照不一致；
+    5. 主表状态与流转表不一致；
+    6. 某阶段已经完成但前端仍显示处理中。
+
+### 6.2 恢复机制
+
+    建议固定以下恢复动作：
+    1. 事件重复：根据`dedupe_key（去重键）` 拦截并记录重复次数；
+    2. 状态异常：根据 `task_state_transitions（状态流转表）` 重新计算当前状态；
+    3. 快照损坏：根据主表状态、最近事件和聚合结果重新生成快照；
+    4. agent失联：根据 Redis（内存键值库）中的租约和心跳判断是否回收任务；
+    5. 长时间无进展：标记为阻塞并生成告警事件。
+
+### 6.3 排障建议
+
+    排查状态问题时，建议按以下顺序进行：
+    1. 先看`tasks（任务主表）` 当前状态；
+    2. 再看 `task_state_transitions（状态流转表）` 最后一次流转；
+    3. 再看 `observation_events（观察事件表）` 最近事件是否被消费；
+    4. 再看 `agent_runs（agent执行表）` 是否有失败、超时、重试；
+    5. 最后看 `task_snapshots（任务快照表）` 是否只是展示层未刷新。
+
+## 7.落地约束
+
+    为保证状态管理长期可用，工程上应固定以下约束：
+    1. 不允许任意agent直接改写`tasks（任务主表）` 的当前状态；
+    2. 不允许以前端轮询结果作为状态推进依据；
+    3. 不允许只写当前状态、不写状态流转日志；
+    4. 不允许只记录成功状态，不记录失败、重试、暂停和人工干预；
+    5. 不允许快照成为唯一数据源，快照只能服务查询；
+    6. 所有英文状态名、字段名和机制名在文档与接口层都应附中文说明，避免多人协作时理解偏差。
 
 # 十、多agent的异步调用与并发设计
 
